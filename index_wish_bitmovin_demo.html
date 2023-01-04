@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Bitmovin SDK - WISH ABR TEST</title>
+  <meta charset="UTF-8"/>
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <script type="text/javascript" src="https://cdn.bitmovin.com/player/web/8/bitmovinplayer.js"></script>
+</head>
+<body>
+
+<div id="bitmovinplayer-video-player"></div>
+
+<script>
+const modeValues = ['save_data', 'balance', 'high_quality'];
+const qfnValues = ['linear', 'logarithm'];
+// Input args
+let mode, title, alk, qualityfn;
+document.addEventListener("DOMContentLoaded", () => {
+  const keyValues = window.location.search.substr(1).split("&");
+  keyValues.forEach((keyValueString) => {
+    let keyValueArray = keyValueString.split("=");
+    switch (keyValueArray[0]) {
+      case "mode":
+        mode = modeValues.find(modeOption => modeOption === keyValueArray[1]);
+        break;
+      case "qualityfn":
+        qualityfn = qfnValues.find(qfnOption => qfnOption === keyValueArray[1]);
+        break;
+      case "title":
+        title = keyValueArray[1];
+        break;
+      case "alk":
+        alk = keyValueArray[1];
+        break;
+    }
+  });
+
+  // These will be used as default values
+  const configSetup = {
+    preferedMode: mode || 'balance',
+    qualityFn: qualityfn || 'linear',
+  }
+
+  const mpdURL =
+    "http://localhost/dataset/" +
+    title +
+    "/manifest.mpd?playerABR=wish-" + configSetup.mode + "-" + configSetup.qualityfn ;
+  let logURL =
+    "http://localhost/log/" + title + "/%event%?playerABR=wish-" + configSetup.mode + "-" + configSetup.qualityfn;
+
+    wishIntegration(mpdURL, logURL, configSetup);
+});
+
+
+const events = ['loadstart', 'suspend', 'abort', 'error', 'emptied', 'stalled', 'loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough', 'playing', 'waiting', 'seeking', 'seeked', 'ended', 'durationchange', 'play', 'pause', 'ratechange']
+
+function wishIntegration(mpd, logURL, configSetup) {
+  let qualitySwitches = 0;
+  const buffer_size = 40;
+  let throughputHistory = [];
+
+  let currentQuality = null;
+  let sameRepCount = 0;
+  let MIN_BUFFER_RATIO = 0.2;
+  let alpha = 0;
+  let beta = 0;
+  let gamma = 0;
+  let denominator_exp = 0;
+  let m_xi = 0;
+  let m_delta = 0;
+  let qualityLevelList = [];
+
+  let smoothThroughputKbps = 0;
+  let num_downloaded_segments = 0;
+  let selected_quality_index_array = [];
+
+  let availableVideoQualities;
+  let last_selected_quality = 0;
+  let next_selected_quality = 0;
+  let bitratesKbps = [];
+  let SD = 4;
+  let currentBufferS;
+  let lastBufferS;
+  let downloadedData;
+
+  let low_buff_thresS = 0;
+  let lastThroughputKbps = 0;
+  let qualityFunction = null;
+  let multiplier = 1;
+  let maxResolution = 0;
+  let videoThroughputKbps = 0;
+  let audioThroughputKbps = 0;
+
+  //<!-- STEP 3 - Configure and Initialize the player-->
+  var playerConfig = {
+    key: "",
+    playback: {
+      autoplay: true,
+      muted: false
+    },
+    style: {
+      width: "1280px",
+      height: "720px"
+    },
+    tweaks: {
+      file_protocol: true,
+      app_id: "ANY_STRING_ID",
+      max_buffer_level: buffer_size,
+    },
+    adaptation: {
+      onVideoAdaptation: wishmmsp,
+    },
+  };
+
+  var container = document.getElementById("bitmovinplayer-video-player");
+  var player = new bitmovin.player.Player(container, playerConfig);
+
+  var sourceConfig = {
+    // dash: "http://127.0.0.1:81/tos_h264_4s/manifest.mpd",
+    // dash: "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd",
+    dash: mpd,
+  };
+
+  function initializeConfiguration() {
+    // document.getElementById("preferences");
+    let preference = configSetup.preferedMode
+
+    switch (preference.value) {
+      case "save_data":
+        m_xi = 1;
+        m_delta = 1;
+        maxResolution = 720;
+        break;
+      case "balance":
+        m_xi = 0.75;
+        m_delta = 0.75;
+        maxResolution = 1080;
+        break;
+      case "high_quality":
+        m_xi = 0.5;
+        m_delta = 0.5;
+        maxResolution = 2160;
+        break;
+    }
+
+    player
+      .load(sourceConfig)
+      .then(function () {
+        console.log("Successfully loaded Source Config!");
+        events.forEach(event => {
+        document.querySelector('#bitmovinplayer-video-player video').addEventListener(event, e => {
+          axios.get(logURL.replace('%event%', e.type) + '&noCache=' + (new Date()).getTime()).catch(error => {
+            console.log(error)
+          })
+        })
+      })
+      })
+      .catch(function (reason) {
+        console.log("Error while loading source:", reason);
+      });
+  }
+
+  ///////////////////////////////////////////////////////////////////////
+  currentBufferS = player.getVideoBufferLength();
+
+  function wishmmsp() {
+    availableVideoQualities = player.getAvailableVideoQualities();
+    next_selected_quality = 0;
+    availableVideoQualities.sort(function (a, b) {
+      return a.bitrate - b.bitrate;
+    });
+    
+    bitratesKbps = []
+    for (var i = 0; i < availableVideoQualities.length; i++) {
+      if (availableVideoQualities[i].height <= maxResolution)
+        bitratesKbps.push(availableVideoQualities[i].bitrate/1000);
+    }
+
+    currentBufferS = player.getVideoBufferLength();
+
+    if (!player) {
+      return;
+    }
+
+    if (
+      player.getConfig().hasOwnProperty("tweaks") &&
+      player.getConfig().tweaks.hasOwnProperty("max_buffer_level")
+    ) {
+      maxBufferLevel = player.getConfig().tweaks.max_buffer_level;
+    } else {
+      maxBufferLevel = 20;
+    }
+
+    var init = function () {
+      player.on(
+        bitmovin.player.PlayerEvent.DownloadFinished,
+        onDownloadFinished
+      );
+      player.on(bitmovin.player.PlayerEvent.SegmentPlayback, function (data) {
+        SD = data.duration;
+      });
+    };
+
+    if (player.getSource()) {
+      init();
+    } else {
+      player.on(bitmovin.player.PlayerEvent.SourceLoaded, init);
+    }
+
+    var nextQuality = onVideoAdaptation();
+    return nextQuality.id;
+  }
+
+  function resetBuffer() {
+    console.log(" resetBuffer ");
+    throughputHistory = [];
+  }
+
+  function onDownloadFinished(event) {
+    const instantThroughputKbps =
+      event.size > 2000
+        ? (event.size * 8) / 1000 / event.downloadTime
+        : lastThroughputKbps;
+    if (event.downloadType === "media/video") {
+      videoThroughputKbps = instantThroughputKbps;
+      lastThroughputKbps = Math.max(videoThroughputKbps, audioThroughputKbps);
+    } else {
+      audioThroughputKbps = instantThroughputKbps;
+      lastThroughputKbps = Math.max(videoThroughputKbps, audioThroughputKbps);
+    }
+  }
+
+  function getSmoothThroughput(
+    margin,
+    lastThroughputKbps,
+    smoothThroughputKbps
+  ) {
+    if (lastThroughputKbps > 0) {
+      if (smoothThroughputKbps === 0) {
+        smoothThroughputKbps = lastThroughputKbps;
+      } else {
+        smoothThroughputKbps =
+          (1 - margin) * smoothThroughputKbps + margin * lastThroughputKbps;
+      }
+    } else {
+      smoothThroughputKbps = 5000; // finetune
+    }
+
+    return smoothThroughputKbps;
+  }
+
+  function getQualityFunction(bitrates, functionType) {
+    let qualityLevelList = [];
+    let length = bitrates.length;
+
+    if (functionType === "linear") {
+      for (let i = 0; i < length; i++) {
+        qualityLevelList.push((1.0 * bitrates[i]) / bitrates[length - 1]);
+      }
+    } else {
+      for (let i = 0; i < length; i++) {
+        qualityLevelList.push(Math.log(bitrates[i] / bitrates[0]));
+      }
+    }
+    return qualityLevelList;
+  }
+
+  function setWeightsLinear(m_xi, m_delta, qualityLevelList, segment_duration) {
+    let num_considered_bitrate = bitratesKbps.length;
+    let R_max_Mbps = bitratesKbps[num_considered_bitrate - 1];
+    let R_o_Mbps = bitratesKbps[num_considered_bitrate - 1];
+    let thrp_optimal = bitratesKbps[num_considered_bitrate - 1];
+    let last_quality_1_Mbps = bitratesKbps[num_considered_bitrate - 2];
+    let optimal_delta_buffer_S = buffer_size * (m_xi - MIN_BUFFER_RATIO);
+
+    let temp_beta_alpha = optimal_delta_buffer_S / segment_duration;
+    let temp_a =
+      2.0 *
+      Math.exp(
+        1 + last_quality_1_Mbps / R_max_Mbps - (2.0 * R_o_Mbps) / R_max_Mbps
+      );
+    let temp_b =
+      (1 + (temp_beta_alpha * SD) / optimal_delta_buffer_S) / thrp_optimal;
+
+    denominator_exp = Math.exp(
+      2 * qualityLevelList[num_considered_bitrate - 1] - 2 * qualityLevelList[0]
+    );
+    alpha =
+      1.0 /
+      (1 + temp_beta_alpha + (R_max_Mbps * temp_b * denominator_exp) / temp_a);
+    beta = temp_beta_alpha * alpha;
+    gamma = 1 - alpha - beta;
+  }
+
+  function setWeightsLogarit(
+    m_xi,
+    m_delta,
+    qualityLevelList,
+    segment_duration
+  ) {
+    let num_considered_bitrate = bitratesKbps.length;
+    let R_i = bitratesKbps[num_considered_bitrate - 1];
+    let R_min = bitratesKbps[0];
+    let Q_k = bitratesKbps[num_considered_bitrate-2];
+    let delta_B = m_xi * buffer_size - low_buff_thresS;
+    denominator_exp = Math.exp(
+      2 * qualityLevelList[num_considered_bitrate - 1] - 2 * qualityLevelList[0]
+    );
+
+    alpha =
+      1 /
+      (1 +
+        delta_B / segment_duration +
+        Math.pow(R_i, 3) /
+          (m_delta *
+            Math.pow(R_min, 2) *
+            Q_K));
+    beta = (alpha * delta_B) / segment_duration;
+    gamma = 1 - alpha - beta;
+  }
+
+  function getTotalCost_v3(
+    bitrates,
+    qualityIndex,
+    estimated_throghputKbps,
+    currentbufferS
+  ) {
+    let totalCost;
+    let bandwidthCost;
+    let bufferCost;
+    let qualityCost;
+    let current_quality_level = qualityLevelList[qualityIndex];
+
+    let temp = (bitrates[qualityIndex] * 1.0) / estimated_throghputKbps; // bitrate is in bps
+    let average_quality = 0;
+    let slice_window = 10;
+    let length_quality = qualityLevelList.length;
+    let num_downloaded_segments = selected_quality_index_array.length;
+    let quality_window = Math.min(slice_window, num_downloaded_segments);
+
+    for (let i = 1; i <= quality_window; i++) {
+      let m_qualityIndex = getQualityIndexFromBitrate(
+        selected_quality_index_array[num_downloaded_segments - i],
+        length_quality
+      );
+      average_quality += qualityLevelList[m_qualityIndex];
+    }
+
+    average_quality = average_quality / quality_window;
+
+    bandwidthCost = temp;
+
+    bufferCost = temp * (SD / (currentbufferS - low_buff_thresS));
+    qualityCost =
+      Math.exp(
+        qualityLevelList[length_quality - 1] +
+          average_quality -
+          2 * current_quality_level
+      ) / denominator_exp;
+    totalCost = alpha * bandwidthCost + beta * bufferCost + gamma * qualityCost;
+
+    return totalCost;
+  }
+
+  function onVideoAdaptation() {
+    const quality_function = configSetup.qualityFn
+    const length = bitratesKbps.length;
+
+    low_buff_thresS = SD;
+    if (downloadedData == null || currentBufferS < SD){
+      downloadedData = availableVideoQualities[0];
+      return downloadedData;
+    }
+    selected_quality_index_array.push(downloadedData.bitrate / 1000);
+    num_downloaded_segments = selected_quality_index_array.length;
+
+    let lowest_cost = Number.MAX_SAFE_INTEGER;
+    let max_quality = 0;
+
+    smoothThroughputKbps = getSmoothThroughput(
+      0.125,
+      lastThroughputKbps,
+      smoothThroughputKbps
+    );
+    var estimated_throghputKbps = Math.min(
+      smoothThroughputKbps,
+      lastThroughputKbps
+    );
+
+    qualityLevelList = getQualityFunction(
+      bitratesKbps,
+      quality_function
+    );
+
+    for (let i = length - 1; i >= 0; i--) {
+      if (bitratesKbps[i] < lastThroughputKbps * (1+0.1)) { // MMSP
+      // if (bitratesKbps[i] < smoothThroughputKbps * (1 + 0.1)) {
+        max_quality = i;
+        break;
+      }
+    }
+
+    if (max_quality === 0) {
+      next_selected_quality = max_quality;
+    }
+
+    if (quality_function == "linear") {
+      multiplier = 100;
+      setWeightsLinear(m_xi, m_delta, qualityLevelList, SD);
+    } else {
+      multiplier = 10000;
+      setWeightsLogarit(m_xi, m_delta, qualityLevelList, SD);
+    }
+
+    for (let i = 1; i <= max_quality; i++) {
+      let currentTotalCost = Math.round(
+        multiplier *
+          getTotalCost_v3(
+            bitratesKbps,
+            i,
+            estimated_throghputKbps,
+            currentBufferS
+          )
+      );
+      if (currentTotalCost <= lowest_cost) {
+        next_selected_quality = i;
+        lowest_cost = currentTotalCost;
+      }
+    }
+
+    // check if it's suitable to decrease the quality
+    const threshold_ = 0.2;
+    if (
+      lastBufferS - currentBufferS < lastBufferS * threshold_ &&
+      next_selected_quality < last_selected_quality
+    ) {
+      next_selected_quality = last_selected_quality;
+    }
+
+    last_selected_quality = next_selected_quality;
+    downloadedData = availableVideoQualities[next_selected_quality];
+    lastBufferS = currentBufferS;
+
+    return availableVideoQualities[next_selected_quality];
+  }
+
+  function getQualityIndexFromBitrate(bitrate, bitrates_length) {
+    for (let i = 0; i < bitrates_length; i++) {
+      if (bitrate == bitratesKbps[i]) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
+  // Triggers the player load
+  initializeConfiguration();
+}
+
+</script>
+</body>
+</html>
